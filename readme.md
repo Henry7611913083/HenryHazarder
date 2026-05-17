@@ -1,13 +1,13 @@
 # HenryHazarder 설명
 
-input 폴더의 이미지를 Transformers 기반 여러 로컬 검열 모델로 앙상블 최적화하는 연구용 프로젝트입니
+input 폴더의 이미지를 Transformers 기반 여러 로컬 검열 모델로 앙상블 최적화하는 연구용 프로젝트입니다
 
 ## 만든 동기
 
-![Claude 4.5](https://shields.io)
-![Claude 4.5 Haiku](https://shields.io)
-![Gemini](https://shields.io)
-![GitHub Copilot](https://shields.io)
+![Claude Sonnet 4.5](https://img.shields.io/badge/Claude_Sonnet_4.5-D97757?logo=anthropic&logoColor=white)
+![Claude Haiku 4.5](https://img.shields.io/badge/Claude_Haiku_4.5-D97757?logo=anthropic&logoColor=white)
+![Gemini](https://img.shields.io/badge/Gemini-4285F4?logo=google&logoColor=white)
+![GitHub Copilot](https://img.shields.io/badge/GitHub_Copilot-000000?logo=githubcopilot&logoColor=white)
 
 먼저, 만든 이유부터 설명하자면 **Glaze**, **Nightshade** 등등같은 적대적 필터의 목적부터가 학습 데이터 포이즈닝입니다.
 

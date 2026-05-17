@@ -1,0 +1,52 @@
+# ── Python ────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+wheels/
+sdist/
+
+# ── uv / virtualenv ───────────────────────────
+.venv/
+.uv/
+uv.lock
+
+# ── Type checkers ─────────────────────────────
+.mypy_cache/
+.pyright/
+.ruff_cache/
+
+# ── Project Data ───────────────────────────────
+input/
+output/
+
+# ── HuggingFace model cache ───────────────────
+.cache/
+*.bin
+*.safetensors
+*.ot
+*.onnx
+
+# ── PyTorch checkpoints ───────────────────────
+*.pt
+*.pth
+
+# ── Jupyter ───────────────────────────────────
+.ipynb_checkpoints/
+*.ipynb
+
+# ── OS ────────────────────────────────────────
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ── IDE ───────────────────────────────────────
+.idea/
+.vscode/
+*.swp
+*.swo

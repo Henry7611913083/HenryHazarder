@@ -9,44 +9,78 @@ input 폴더의 이미지를 Transformers 기반 여러 로컬 검열 모델로 
 ![Gemini](https://img.shields.io/badge/Gemini-4285F4?logo=google&logoColor=white)
 ![GitHub Copilot](https://img.shields.io/badge/GitHub_Copilot-000000?logo=githubcopilot&logoColor=white)
 
-먼저, 만든 이유부터 설명하자면 **Glaze**, **Nightshade** 등등같은 적대적 필터의 목적부터가 학습 데이터 포이즈닝입니다.
+먼저, 만든 이유부터 설명하자면 **Glaze**, **Nightshade** 등등같은 적대적 필터의 목적부터가 학습 데이터 포이즈닝 때문에입니다.
 
 네, 추론 단계에선 **정상적으로 인식해서** 문제입니다,  하지만 우리 인간들이 기대한 건 **LLM도 못 알아볼 만큼 왜곡하는 것이였습니다**.
 
 제가 거기서 더 효과적이고 빠른 방법을 생각해봤는데 **일부러 검열 모델이 검열해야 할 흉물로 인식시켜서** 학습 데이터에 못 들어가게 하는 방법입니다. 
 
-> 그래서 더 강화시킬 수 있는 방법을 제미나이에게 여러 번 물어보며 몇 개를 뽑고 그 다음 제가 떠올린 방법을 초기 코드를 Claude Sonnet 4.5가 짜고 세션 한도 때문에 깃허브 코파일럿으로 갔는데 클로드 하이쿠 4.5가 기본값이라 그대로 썼는데 생각보다 성능이 좋더라고요. (그 후엔 소넷 4.5로 갔지만)
+> 그래서 더 강화시킬 수 있는 방법을 제미나이에게 여러 번 물어보며 몇 개를 뽑고 그 다음 제가 떠올린 방법을 초기 코드를 Claude Sonnet 4.5가 짜고 세션 한도 때문에 깃허브 코파일럿으로 갔는데 클로드 하이쿠 3.5가 기본값이라 그대로 썼는데 생각보다 성능이 좋더라고요. (그 후엔 소넷 4.5로 갔지만)
 
-## 셋팅과 실행
+## 설치
 
-```
+### 필수 요구사항
+- Python 3.12+
+- CUDA 12.1+ (GPU 사용 시) 또는 ROCm 6.0+ (AMD GPU)
+
+### 기본 설치
+
+```bash
 # 저장소 복제
-https://github.com/Henry7611913083/HenryHazarder
+git clone https://github.com/Henry7611913083/HenryHazarder
 cd HenryHazarder
 
 # uv 설치
 curl -LsSf https://astral.sh/uv/install.sh | sh
 
-# 만약 윈도우즈 파워셸 쓰신다면:
+# Windows PowerShell:
 irm https://astral.sh/uv/install.ps1 | iex
 
-# venv 세팅
+# 의존성 설치
 uv sync
+```
 
-# 만약 cuda나 rocm 있으시면:
-uv pip install torch torchvision --index-url https://download.pytorch.org/whl/<cu126 or rocm7.2>
+### GPU 지원 (선택사항)
 
-# 입력 폴더 만들고 여기에 이미지를 넣으세요
+```bash
+# NVIDIA CUDA 12.x
+uv pip install torch torchvision --index-url https://download.pytorch.org/whl/cu126
+
+# AMD ROCm 6.0+
+uv pip install torch torchvision --index-url https://download.pytorch.org/whl/rocm6.0
+
+# Apple Silicon (MPS)
+# 기본 torch에서 자동 지원됨
+```
+
+## 셋팅과 실행
+
+```bash
+# 입력 폴더 생성
 mkdir input
 cp yourimage.png input/
 
-# 실행
+# 기본 실행
 uv run python nsfw_attack.py
-uv run python nsfw_attack.py --steps 200 --eps 0.05 --robust
+
+# GPU 명시적 지정 (CUDA:0)
+CUDA_VISIBLE_DEVICES=0 uv run python nsfw_attack.py
+
+# accelerate 사용 (분산 학습/멀티 GPU)
+accelerate launch nsfw_attack.py
+
+# 고급 옵션
+uv run python nsfw_attack.py \
+  --input ./input \
+  --output ./output \
+  --steps 200 \
+  --eps 0.05 \
+  --robust \
+  --model Falconsai/nsfw_image_detection \
+  --model another-model-id
 ```
+
 ## 파라미터별 특성
-
-
 
 | 파라미터 | 기본값 | 설명 |
 |---|---|---|
@@ -65,3 +99,63 @@ uv run python nsfw_attack.py --steps 200 --eps 0.05 --robust
 | `--use-transforms` | `False` | 회전·스케일·이동 변환을 적용해 기하 변환 내성 부여 |
 | `--preserve-hf` | `False` | DCT 고주파 성분을 증폭해 다운샘플링 후에도 perturbation 생존율++ (scipy 필요) |
 | `--robust` | `False` | 위 4가지 Robustness 옵션을 한 번에 활성화 |
+
+(여기서부턴 클로드가 맘대로 쓴거)
+## 성능 최적화
+
+### 메모리 부족 시
+```bash
+# 배치 크기 축소 (단일 이미지 처리)
+# --batch-size 1 (아직 미구현, 기본 1개씩)
+
+# LPIPS 비활성화
+uv run python nsfw_attack.py --no-lpips
+
+# 리사이즈로 입력 크기 감소
+uv run python nsfw_attack.py --resize 224
+```
+
+### 속도 향상
+```bash
+# 스텝 감소
+uv run python nsfw_attack.py --steps 50
+
+# LPIPS 제거
+uv run python nsfw_attack.py --no-lpips
+
+# 멀티 GPU (accelerate)
+accelerate config  # GPU 설정
+accelerate launch nsfw_attack.py
+```
+
+## 개발 및 기여
+
+### 코드 포맷팅 및 검사
+```bash
+# 포맷팅
+uv run ruff format .
+
+# 린트 확인
+uv run ruff check .
+
+# 타입 체크
+uv run pyright
+```
+
+### 테스트 실행
+```bash
+# 기본 테스트
+uv run pytest
+
+# 커버리지 포함
+uv run pytest --cov=nsfw_attack
+```
+
+## 라이선스
+
+MIT License - 자유롭게 사용, 수정, 배포 가능합니다.
+
+## 참고사항
+
+이 프로젝트는 **연구 목적**으로만 사용되어야 합니다. 
+악의적인 목적으로 사용하는 것은 법적 책임을 질 수 있습니다.

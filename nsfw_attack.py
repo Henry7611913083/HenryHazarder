@@ -37,6 +37,7 @@ import sys
 import time
 from pathlib import Path
 
+from accelerate import Accelerator
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -279,7 +280,7 @@ def compute_scores_single_class(
 def pgd_attack(
     ensemble: list[tuple],
     nsfw_class_indices: list[int],
-    input_sizes: list[int],          # 추가: 모델별 입력 크기
+    input_sizes: list[int],
     orig_tensor: torch.Tensor,
     device: torch.device,
     image_name: str,
@@ -289,7 +290,9 @@ def pgd_attack(
     lambda_lpips: float = 2.0,
     mu_l2: float = 0.5,
     lpips_net=None,
+    accelerator=None,  # ✓ 추가
 ) -> torch.Tensor:
+    """PGD attack with optional accelerator support."""
     orig = orig_tensor.to(device)
     delta = torch.zeros_like(orig, requires_grad=True, device=device)
 
@@ -306,7 +309,9 @@ def pgd_attack(
     for _, _, m in ensemble:
         m.eval()
 
-    log.info(f"[{image_name}] starting PGD  steps={steps}  eps={eps}  lr={lr}")
+    # ✓ accelerator.print() 사용 (main process만 출력)
+    log_fn = accelerator.print if accelerator else log.info
+    log_fn(f"[{image_name}] starting PGD  steps={steps}  eps={eps}  lr={lr}")
 
     t0 = time.time()
     for step in range(1, steps + 1):
@@ -348,7 +353,7 @@ def pgd_attack(
             delta.clamp_(-eps, eps)
 
         nsfw_scores_str = "  ".join(f"{p.item():.4f}" for p in nsfw_probs)
-        log.info(
+        log_fn(
             f"[{image_name}] step [{step:0{step_w}d}/{steps}]  "
             f"loss={loss.item():.6f}  "
             f"loss_cls={loss_cls.item():.6f}  "
@@ -358,7 +363,7 @@ def pgd_attack(
         )
 
     elapsed = time.time() - t0
-    log.info(f"[{image_name}] PGD complete  elapsed={elapsed:.1f}s")
+    log_fn(f"[{image_name}] PGD complete  elapsed={elapsed:.1f}s")
 
     with torch.no_grad():
         result = (orig + delta).cpu().clamp(0, 1)
@@ -444,6 +449,12 @@ def main() -> None:
 
     args = parser.parse_args()
 
+    accelerator = Accelerator(
+        mixed_precision="no",  # "fp16", "bf16", "fp8", "no" 중 선택
+        gradient_accumulation_steps=1,
+        cpu=False,
+    )
+
     if args.models is None:
         args.models = ["Falconsai/nsfw_image_detection"]
 
@@ -456,12 +467,11 @@ def main() -> None:
 
     run_start = time.time()
 
-    # ── Device ──
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    log.info(f"device: {device}")
-    if device.type == "cuda":
-        props = torch.cuda.get_device_properties(0)
-        log.info(f"GPU: {props.name}  VRAM: {props.total_memory / 1e9:.1f} GB")
+    device = accelerator.device  # ✓ Accelerator가 자동 결정
+
+    accelerator.print(f"device: {device}")
+    accelerator.print(f"distributed_type: {accelerator.distributed_type}")
+    accelerator.print(f"num_processes: {accelerator.num_processes}")
 
     # ── Paths ──
     input_dir = Path(args.input)
@@ -480,9 +490,16 @@ def main() -> None:
     for model_id in args.models:
         fe = AutoImageProcessor.from_pretrained(model_id)
         m = AutoModelForImageClassification.from_pretrained(model_id)
-        m.to(device).eval()
+        m = accelerator.prepare_model(m)  # ✓ 모델 준비
+        m.eval()
         ensemble.append((model_id, fe, m))
         log.info(f"  loaded: {model_id}  labels={m.config.id2label}")
+
+    if HAS_LPIPS and not args.no_lpips:
+        log.info("loading LPIPS perceptual loss network")
+        lpips_net = _lpips_mod.LPIPS(net="alex")
+        lpips_net = accelerator.prepare_model(lpips_net)  # ✓ 모델 준비
+        lpips_net.eval()
 
     norm_params = [
     (
@@ -497,7 +514,7 @@ def main() -> None:
         for _, _, m in ensemble
     ]
     for (model_id, _, _), sz in zip(ensemble, input_sizes):
-        log.info(f"  [{model_id}] input size: {sz}×{sz}")
+        accelerator.print(f"  [{model_id}] input size: {sz}×{sz}")
 
     # NSFW 클래스 인덱스 모델별로 resolve
     def resolve_nsfw_idx(m) -> int:
@@ -530,9 +547,11 @@ def main() -> None:
         log.info("─" * 72)
         log.info(f"processing image [{img_idx}/{len(images)}]: {img_path.name}")
 
+        # ✓ 먼저 정의
         model_header = "  ".join(
             f"[{i}] {model_id}" for i, (model_id, _, _) in enumerate(ensemble)
         )
+        accelerator.print(f"[{img_path.name}] models: {model_header}")
         log.info(f"[{img_path.name}] models: {model_header}")
 
         size = (args.resize, args.resize) if args.resize else None
@@ -558,6 +577,7 @@ def main() -> None:
             lambda_lpips=args.lambda_lpips,
             mu_l2=args.mu_l2,
             lpips_net=lpips_net,
+            accelerator=accelerator,  # ✓ 추가
         )
 
         # 공격 후 스코어 — 앙상블 평균
@@ -577,9 +597,12 @@ def main() -> None:
             f"{orig_nsfw_avg:.4f} → {adv_nsfw_avg:.4f} ({delta_nsfw:+.4f})"
         )
 
-        out_path = output_dir / (img_path.stem + "_adv.png")
-        save_image(adv_tensor, out_path)
-        log.info(f"[{img_path.name}] saved → {out_path}")
+        if accelerator.is_main_process:
+            out_path = output_dir / (img_path.stem + "_adv.png")
+            save_image(adv_tensor, out_path)
+            accelerator.print(f"[{img_path.name}] saved → {out_path}")
+        else:
+            out_path = output_dir / (img_path.stem + "_adv.png")
 
         results.append(
             {
@@ -595,12 +618,13 @@ def main() -> None:
     total_elapsed = time.time() - run_start
     avg_elapsed = total_elapsed / len(results)
 
-    log.info("═" * 72)
-    log.info("FINISHED")
-    log.info(f"  total images  : {len(results)}")
-    log.info(f"  total elapsed : {total_elapsed:.1f}s  ({avg_elapsed:.1f}s / image)")
-    log.info(f"  output dir    : {output_dir.resolve()}")
-    log.info("  results:")
+    if accelerator.is_main_process:
+        log.info("═" * 72)
+        log.info("FINISHED")
+        log.info(f"  total images  : {len(results)}")
+        log.info(f"  total elapsed : {total_elapsed:.1f}s  ({avg_elapsed:.1f}s / image)")
+        log.info(f"  output dir    : {output_dir.resolve()}")
+        log.info("  results:")
     for r in results:
         log.info(
             f"    {r['name']:<32}  "

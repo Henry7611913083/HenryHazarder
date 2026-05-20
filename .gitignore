@@ -1,52 +1,56 @@
-# ── Python ────────────────────────────────────
+# Python
 __pycache__/
 *.py[cod]
-*.pyo
-*.pyd
+*$py.class
 *.so
-*.egg
-*.egg-info/
-dist/
+.Python
 build/
-wheels/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
 sdist/
+var/
+wheels/
+pip-wheel-metadata/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
 
-# ── uv / virtualenv ───────────────────────────
-.venv/
-.uv/
-uv.lock
+# venv
+venv/
+ENV/
+env/
+.venv
 
-# ── Type checkers ─────────────────────────────
-.mypy_cache/
-.pyright/
-.ruff_cache/
-
-# ── Project Data ───────────────────────────────
-input/
-output/
-
-# ── HuggingFace model cache ───────────────────
-.cache/
-*.bin
-*.safetensors
-*.ot
-*.onnx
-
-# ── PyTorch checkpoints ───────────────────────
-*.pt
-*.pth
-
-# ── Jupyter ───────────────────────────────────
-.ipynb_checkpoints/
-*.ipynb
-
-# ── OS ────────────────────────────────────────
-.DS_Store
-Thumbs.db
-desktop.ini
-
-# ── IDE ───────────────────────────────────────
-.idea/
+# IDE
 .vscode/
+.idea/
 *.swp
 *.swo
+*~
+.DS_Store
+
+# Project specific
+input/
+output/
+*.pth
+*.pt
+*.pkl
+checkpoints/
+logs/
+*.log
+
+# accelerate 설정
+~/.cache/huggingface/accelerate/
+
+# Model cache
+.cache/
+huggingface/
+models/

@@ -1,18 +1,53 @@
 [project]
 name = "nsfw-attack"
-version = "0.1.0"
+version = "0.2.0"  # ✓ 업데이트
+description = "NSFW adversarial attack using transformers and accelerate"  # ✓ 추가
+readme = "readme.md"  # ✓ 추가
 requires-python = ">=3.12"
+authors = [
+    {name = "HenryHazarder", email = "your-email@example.com"}  # ✓ 추가
+]
+license = {text = "MIT"}  # ✓ 추가
+keywords = ["nsfw", "adversarial", "attack", "transformers"]  # ✓ 추가
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
 dependencies = [
+    "torch>=2.0.0",  # ✓ 명시적 버전 지정
     "transformers>=4.40",
     "pillow>=10.0",
     "lpips>=0.1.4",
+    "accelerate>=0.28",  # ✓ accelerate 추가
+    "tqdm>=4.65",  # ✓ 진행률 표시용
 ]
 
-[dependency-groups]
+[project.optional-dependencies]
 dev = [
     "ruff>=0.4",
     "pyright>=1.1",
+    "pytest>=7.4",  # ✓ 테스트용
 ]
+cuda = [
+    "torch[cuda-12]>=2.0.0",  # ✓ CUDA 12 지원
+]
+rocm = [
+    "torch[rocm-6.0]>=2.0.0",  # ✓ ROCm 지원
+]
+
+[project.urls]
+Homepage = "https://github.com/Henry7611913083/HenryHazarder"
+Repository = "https://github.com/Henry7611913083/HenryHazarder.git"
+Issues = "https://github.com/Henry7611913083/HenryHazarder/issues"
+
+[build-system]
+requires = ["hatchling"]  # ✓ 추가
+build-backend = "hatchling.build"  # ✓ 추가
 
 # ── ruff ──────────────────────────────────────
 [tool.ruff]
@@ -41,7 +76,6 @@ known-first-party = ["nsfw_attack"]
 [tool.pyright]
 pythonVersion = "3.12"
 typeCheckingMode = "standard"
-# torch 타입 스텁이 불완전하므로 외부 라이브러리 오류는 무시
 reportMissingModuleSource = false
 reportUnknownMemberType = false
 reportUnknownVariableType = false

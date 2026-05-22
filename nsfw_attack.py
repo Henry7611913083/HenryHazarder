@@ -1,7 +1,7 @@
 """
 참고로 이거 클로드 소넷 4.5가 짰고
 나머지 뒤는 Github 코파일럿에 있는 클로드 하이쿠 3.5가 짜고
-다시 클로드 소넷 4.5가 짜고
+다시 클로드 소넷 4.5가 짜고 등등
 제가 확인했어요, 누군가 고쳐주신다면 감사하겠습니다
 
 nsfw_attack.py
@@ -290,7 +290,10 @@ def pgd_attack(
     lambda_lpips: float = 2.0,
     mu_l2: float = 0.5,
     lpips_net=None,
-    accelerator=None,  # ✓ 추가
+    accelerator=None,
+    label_smooth: float = 0.1,
+    lambda_kl: float = 0.3,
+    kl_temp: float = 2.0,
 ) -> torch.Tensor:
     """PGD attack with optional accelerator support."""
     orig = orig_tensor.to(device)
@@ -336,15 +339,48 @@ def pgd_attack(
             nsfw_probs.append(prob)
 
         nsfw_prob = torch.stack(nsfw_probs).mean()
-        loss_cls = -nsfw_prob
         loss_l2 = (delta**2).mean()
+
+        loss_cls_list = []
+        loss_kl_list = []
+
+        for (_, _, m), nsfw_idx, (mean_t, std_t), sz in zip(
+            ensemble, nsfw_class_indices, norm_params, input_sizes
+        ):
+            adv_resized = F.interpolate(
+                adv_native.unsqueeze(0), size=(sz, sz),
+                mode="bilinear", align_corners=False,
+            )
+            pixel_values_adv = (adv_resized - mean_t) / std_t
+            logits_adv = m(pixel_values=pixel_values_adv).logits
+
+            num_classes = logits_adv.shape[1]
+            soft_target = torch.full_like(logits_adv, label_smooth / (num_classes - 1))
+            soft_target[0, nsfw_idx] = 1.0 - label_smooth
+            log_probs_adv = F.log_softmax(logits_adv, dim=1)
+            loss_cls_list.append(F.kl_div(log_probs_adv, soft_target, reduction="batchmean"))
+
+            with torch.no_grad():
+                orig_resized = F.interpolate(
+                    orig.unsqueeze(0), size=(sz, sz),
+                    mode="bilinear", align_corners=False,
+                )
+                pixel_values_orig = (orig_resized - mean_t) / std_t
+                logits_orig = m(pixel_values=pixel_values_orig).logits
+
+            p_orig = F.softmax(logits_orig / kl_temp, dim=1)
+            log_p_adv = F.log_softmax(logits_adv / kl_temp, dim=1)
+            loss_kl_list.append(F.kl_div(log_p_adv, p_orig, reduction="batchmean"))
+
+        loss_cls = torch.stack(loss_cls_list).mean()
+        loss_kl  = torch.stack(loss_kl_list).mean()
 
         if lpips_net is not None:
             loss_lpips = lpips_net(orig.unsqueeze(0), adv_native.unsqueeze(0)).mean()
-            loss = loss_cls + lambda_lpips * loss_lpips + mu_l2 * loss_l2
+            loss = loss_cls + lambda_kl * loss_kl + lambda_lpips * loss_lpips + mu_l2 * loss_l2
         else:
             loss_lpips = torch.tensor(0.0)
-            loss = loss_cls + mu_l2 * loss_l2
+            loss = loss_cls + lambda_kl * loss_kl + mu_l2 * loss_l2
 
         loss.backward()
         optimizer.step()
@@ -357,6 +393,7 @@ def pgd_attack(
             f"[{image_name}] step [{step:0{step_w}d}/{steps}]  "
             f"loss={loss.item():.6f}  "
             f"loss_cls={loss_cls.item():.6f}  "
+            f"loss_kl={loss_kl.item():.6f}  "
             f"loss_lpips={loss_lpips.item():.6f}  "
             f"loss_l2={loss_l2.item():.6f}  |  "
             f"nsfw: {nsfw_scores_str}"
@@ -407,6 +444,24 @@ def main() -> None:
         type=float,
         default=0.5,
         help="Weight for L2 pixel regularisation",
+    )
+    parser.add_argument(
+        "--label-smooth",
+        type=float,
+        default=0.1,
+        help="Soft label smoothing factor α (default 0.1)",
+    )
+    parser.add_argument(
+        "--lambda-kl",
+        type=float,
+        default=0.3,
+        help="Weight for KL divergence regularisation (default 0.3)",
+    )
+    parser.add_argument(
+        "--kl-temp",
+        type=float,
+        default=2.0,
+        help="Temperature for KL divergence scaling (default 2.0)",
     )
     parser.add_argument(
         "--no-lpips",
@@ -577,7 +632,10 @@ def main() -> None:
             lambda_lpips=args.lambda_lpips,
             mu_l2=args.mu_l2,
             lpips_net=lpips_net,
-            accelerator=accelerator,  # ✓ 추가
+            accelerator=accelerator,
+            label_smooth=args.label_smooth,
+            lambda_kl=args.lambda_kl,
+            kl_temp=args.kl_temp,
         )
 
         # 공격 후 스코어 — 앙상블 평균

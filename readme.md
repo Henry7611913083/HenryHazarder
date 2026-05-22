@@ -2,6 +2,8 @@
 
 input 폴더의 이미지를 Transformers 기반 여러 로컬 검열 모델로 앙상블 최적화하는 연구용 프로젝트입니다
 
+많은 분들도 저도 했다가 말았던 착각이 있는데 nsfw 손실은 소프트 라벨 때문에 0.9999 또는 1.000까지 안 올라가요
+
 ## 만든 동기
 
 ![Claude Sonnet 4.5](https://img.shields.io/badge/Claude_Sonnet_4.5-D97757?logo=anthropic&logoColor=white)
@@ -15,7 +17,7 @@ input 폴더의 이미지를 Transformers 기반 여러 로컬 검열 모델로 
 
 제가 거기서 더 효과적이고 빠른 방법을 생각해봤는데 **일부러 검열 모델이 검열해야 할 흉물로 인식시켜서** 학습 데이터에 못 들어가게 하는 방법입니다. 
 
-> 그래서 더 강화시킬 수 있는 방법을 제미나이에게 여러 번 물어보며 몇 개를 뽑고 그 다음 제가 떠올린 방법을 초기 코드를 Claude Sonnet 4.5가 짜고 세션 한도 때문에 깃허브 코파일럿으로 갔는데 클로드 하이쿠 3.5가 기본값이라 그대로 썼는데 생각보다 성능이 좋더라고요. (그 후엔 소넷 4.5로 갔지만)
+> 그래서 더 강화시킬 수 있는 방법을 제미나이에게 여러 번 물어보며 몇 개를 뽑고 그 다음 제가 떠올린 방법을 초기 코드를 Claude Sonnet 4.5가 짜고 세션 한도 때문에 깃허브 코파일럿으로 갔는데 클로드 하이쿠 3.5가 기본값이라 그대로 썼는데 생각보다 성능이 좋더라고요. (그 후엔 소넷 4.6, 하이쿠 4.6 번갈아썼지만)
 
 ## 설치
 
@@ -92,6 +94,9 @@ uv run python nsfw_attack.py \
 | `--lr` | `0.005` | Adam 학습률. 너무 크면 발산, 너무 작으면 수렴 느림 |
 | `--lambda-lpips` | `2.0` | LPIPS 지각적 손실 가중치. 높을수록 원본 외관 보존++ 공격력-- |
 | `--mu-l2` | `0.5` | L2 픽셀 정규화 가중치. 높을수록 perturbation 크기 억제 |
+| `--label-smooth` | `0.1` | 소프트 라벨 평활화율 α. 목표 NSFW 확률이 (1-α)로 설정됨. 낮을수록 공격력++ gradient 불안정 위험++ |
+| `--lambda-kl` | `0.3` | KL 발산 정규화 가중치. 높을수록 원본 분포 보존++ 공격력-- |
+| `--kl-temp` | `2.0` | KL 발산 Temperature scaling. 높을수록 분포가 부드러워져 gradient 안정++ |
 | `--no-lpips` | `False` | LPIPS 비활성화. 속도++ 지각적 품질-- |
 | `--resize` | `None` | 처리 전 이미지를 정사각형으로 리사이즈 (예: `224`) |
 | `--multi-scale` | `False` | 0.5×, 0.75×, 1.0× 스케일에서 평가해 스케일 변환 내성 부여 |
@@ -126,6 +131,27 @@ uv run python nsfw_attack.py --no-lpips
 # 멀티 GPU (accelerate)
 accelerate config  # GPU 설정
 accelerate launch nsfw_attack.py
+```
+
+### KL 파라미터 <- 이건 헨리가 씀
+```bash
+# 소프트 라벨 + KL 발산 활성화 (기본값)
+uv run python nsfw_attack.py \
+  --label-smooth 0.1 \
+  --lambda-kl 0.3 \
+  --kl-temp 2.0
+
+# 공격력 우선 (평활화 강화, KL 억제)
+uv run python nsfw_attack.py \
+  --label-smooth 0.05 \
+  --lambda-kl 0.1 \
+  --kl-temp 1.5
+
+# 전이성 우선 (분포 보존 강화)
+uv run python nsfw_attack.py \
+  --label-smooth 0.15 \
+  --lambda-kl 0.5 \
+  --kl-temp 3.0
 ```
 
 ## 개발 및 기여

@@ -1,7 +1,7 @@
 [project]
-name = "nsfw-attack"
+name = "classifier-attack"
 version = "0.2.0"  # ✓ 업데이트
-description = "NSFW adversarial attack using transformers and accelerate"  # ✓ 추가
+description = "Generic adversarial attack against image classifiers using transformers and accelerate"
 readme = "readme.md"  # ✓ 추가
 requires-python = ">=3.12"
 authors = [
@@ -19,12 +19,15 @@ classifiers = [
 ]
 
 dependencies = [
-    "torch>=2.0.0",  # ✓ 명시적 버전 지정
+    "torch>=2.0.0",
     "transformers>=4.40",
     "pillow>=10.0",
     "lpips>=0.1.4",
-    "accelerate>=0.28",  # ✓ accelerate 추가
-    "tqdm>=4.65",  # ✓ 진행률 표시용
+    "accelerate>=0.28",
+    "tqdm>=4.65",
+    "timm>=0.9.0",         # ← timm 백엔드 지원을 위해 추가
+    "open-clip-torch",     # ← CLIP/SigLIP 백엔드 지원을 위해 추가
+    "scipy>=1.10.0",       # ← --preserve-hf 옵션(DCT 고주파)을 위해 추가
 ]
 
 [project.optional-dependencies]
@@ -70,7 +73,7 @@ ignore = [
 ]
 
 [tool.ruff.lint.isort]
-known-first-party = ["nsfw_attack"]
+known-first-party = ["classifier_attack"]
 
 # ── pyright ───────────────────────────────────
 [tool.pyright]

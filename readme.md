@@ -63,16 +63,16 @@ mkdir input
 cp yourimage.png input/
 
 # 기본 실행
-uv run python nsfw_attack.py
+uv run python classifier_attack.py
 
 # GPU 명시적 지정 (CUDA:0)
-CUDA_VISIBLE_DEVICES=0 uv run python nsfw_attack.py
+CUDA_VISIBLE_DEVICES=0 uv run python classifier_attack.py
 
 # accelerate 사용 (분산 학습/멀티 GPU)
-accelerate launch nsfw_attack.py
+accelerate launch classifier_attack.py
 
 # 고급 옵션
-uv run python nsfw_attack.py \
+uv run python classifier_attack.py \
   --input ./input \
   --output ./output \
   --steps 200 \
@@ -88,7 +88,8 @@ uv run python nsfw_attack.py \
 |---|---|---|
 | `--input` | `./input` | 입력 이미지 디렉토리 |
 | `--output` | `./output` | 출력 이미지 디렉토리 |
-| `--model` | `Falconsai/nsfw_image_detection` | HuggingFace 모델 ID. 여러 번 지정하면 앙상블로 동작 |
+| `-S` | `Falconsai/nsfw_image_detection:nsfw` | `MODEL_ID:TARGET_CLASS` 형식으로 모델과 타겟 클래스를 함께 지정. 여러 번 지정하면 앙상블로 동작. TARGET_CLASS는 라벨 부분 문자열(`nsfw`, `explicit` 등) 또는 정수 인덱스(`0`, `1` 등) 
+| `--model` | *(deprecated)* | ~~HuggingFace 모델 ID~~ `-S` 사용 권장. 하위 호환용으로 유지되며 타겟 클래스는 `nsfw` 라벨 자동 탐색 |
 | `--eps` | `0.03` | 픽셀당 최대 변화량 (≈ 7.6/255). 높을수록 공격력++ 시각적 변화++ |
 | `--steps` | `100` | PGD 반복 횟수. 높을수록 수렴도++, 시간++ |
 | `--lr` | `0.005` | Adam 학습률. 너무 크면 발산, 너무 작으면 수렴 느림 |
@@ -114,41 +115,41 @@ uv run python nsfw_attack.py \
 # --batch-size 1 (아직 미구현, 기본 1개씩)
 
 # LPIPS 비활성화
-uv run python nsfw_attack.py --no-lpips
+uv run python classifier_attack.py --no-lpips
 
 # 리사이즈로 입력 크기 감소
-uv run python nsfw_attack.py --resize 224
+uv run python classifier_attack.py --resize 224
 ```
 
 ### 속도 향상
 ```bash
 # 스텝 감소
-uv run python nsfw_attack.py --steps 50
+uv run python classifier_attack.py --steps 50
 
 # LPIPS 제거
-uv run python nsfw_attack.py --no-lpips
+uv run python classifier_attack.py --no-lpips
 
 # 멀티 GPU (accelerate)
 accelerate config  # GPU 설정
-accelerate launch nsfw_attack.py
+accelerate launch classifier_attack.py
 ```
 
 ### KL 파라미터 <- 이건 헨리가 씀
 ```bash
 # 소프트 라벨 + KL 발산 활성화 (기본값)
-uv run python nsfw_attack.py \
+uv run python classifier_attack.py \
   --label-smooth 0.1 \
   --lambda-kl 0.3 \
   --kl-temp 2.0
 
 # 공격력 우선 (평활화 강화, KL 억제)
-uv run python nsfw_attack.py \
+uv run python classifier_attack.py \
   --label-smooth 0.05 \
   --lambda-kl 0.1 \
   --kl-temp 1.5
 
 # 전이성 우선 (분포 보존 강화)
-uv run python nsfw_attack.py \
+uv run python classifier_attack.py \
   --label-smooth 0.15 \
   --lambda-kl 0.5 \
   --kl-temp 3.0

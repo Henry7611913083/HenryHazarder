@@ -262,6 +262,8 @@ class VisionClassifierWrapper(ABC):
 
 # ── Back-end 1: HuggingFace AutoModelForImageClassification ───────────────────
 
+# vision_classifier_wrapper.py 의 관련 부분을 아래와 같이 수정합니다.
+
 class HFClassifierWrapper(VisionClassifierWrapper):
     """
     Wrapper for HuggingFace AutoModelForImageClassification models.
@@ -274,37 +276,36 @@ class HFClassifierWrapper(VisionClassifierWrapper):
         target_idx: int,
         activation: ActivationFn = ActivationFn.SOFTMAX
     ):
+        model_cls_name = type(model).__name__.lower()
+        if "siglip" in model_cls_name or "siglip" in model_id.lower():
+            activation = ActivationFn.SIGMOID
+
         super().__init__(model_id, target_idx, activation)
+        self._device = next(model.parameters()).device
         self._model = model
         self.id2label = model.config.id2label
-        
-        # 0. 디바이스 변수를 가중치 상태에 맞게 수동 초기화 (안전장치)
-        self._device = next(model.parameters()).device
 
-        # 1. 해상도(input_size) 파싱 초강력 방어 코드
-        if hasattr(processor, "size") and isinstance(processor.size, dict):
-            self.input_size = processor.size.get("height", 224)
+        if hasattr(model.config, "vision_config") and hasattr(model.config.vision_config, "image_size"):
+            self.input_size = model.config.vision_config.image_size
+        elif hasattr(processor, "size") and isinstance(processor.size, dict):
+            self.input_size = processor.size.get("height", processor.size.get("shortest_edge", 224))
         elif hasattr(processor, "size") and isinstance(processor.size, int):
             self.input_size = processor.size
         elif hasattr(model, "config") and hasattr(model.config, "image_size") and model.config.image_size:
             self.input_size = model.config.image_size
         elif hasattr(model, "timm_model") and hasattr(model.timm_model, "default_cfg"):
-            # Timm 백엔드 래퍼 모델 구조인 경우 내부 default_cfg를 추적하여 448 스케일 강제 획득
             self.input_size = model.timm_model.default_cfg.get("input_size", (3, 224, 224))[-1]
-        elif hasattr(model, "config") and hasattr(model.config, "hf_model_config") and hasattr(model.config.hf_model_config, "image_size"):
-            self.input_size = model.config.hf_model_config.image_size
         else:
-            # 모델 ID 이름에 '448' 문자열이 명시되어 있다면 휴리스틱하게 가로챈다
-            if "448" in model_id:
+            if "384" in model_id or "siglip" in model_id.lower():
+                self.input_size = 384
+            elif "448" in model_id:
                 self.input_size = 448
             else:
                 self.input_size = 224
 
-        # 디버깅 및 명세 확인용 로그 강제 출력 (터미널에서 직접 확인용)
         import logging
-        logging.info(f"  [{model_id}] Resolved execution input size: {self.input_size}x{self.input_size}")
+        logging.info(f"  [{model_id}] Resolved execution input size: {self.input_size}x{self.input_size} | Activation: {self.activation}")
 
-        # 2. TimmWrapperImageProcessor 및 누락된 프로세서 속성 방어
         if hasattr(processor, "image_mean"):
             mean_val = processor.image_mean
             std_val = processor.image_std
@@ -312,11 +313,13 @@ class HFClassifierWrapper(VisionClassifierWrapper):
             mean_val = processor.image_processor.mean
             std_val = processor.image_processor.std
         else:
-            # 최종 Fallback (표준 ImageNet/ViT 규격)
-            mean_val = [0.5, 0.5, 0.5]
-            std_val = [0.5, 0.5, 0.5]
+            if "siglip" in model_cls_name or "siglip" in model_id.lower():
+                mean_val = [0.5, 0.5, 0.5]
+                std_val = [0.5, 0.5, 0.5]
+            else:
+                mean_val = [0.485, 0.456, 0.406]
+                std_val = [0.229, 0.224, 0.225]
 
-        # 3. 모델 가중치가 배치된 디바이스 위치로 함께 주입
         self._mean = nn.Parameter(
             torch.tensor(mean_val, dtype=torch.float32).view(1, 3, 1, 1).to(self._device),
             requires_grad=False
@@ -326,37 +329,57 @@ class HFClassifierWrapper(VisionClassifierWrapper):
             requires_grad=False
         )
 
+    # ── [필수] 추상 메서드 실체화 구현 파트 ───────────────────────────────────
+
     def preprocess(self, x: torch.Tensor) -> torch.Tensor:
-        # 입력받은 텐서를 현재 모델이 동작하는 디바이스로 강제 이동
+        """
+        Differentiable PGD-friendly image preprocessing channel.
+        Input: [C, H, W] or [B, C, H, W] tensor in range [0, 1]
+        """
         x = x.to(self._device)
-        
-        if x.ndim == 3:
+
+        if x.dim() == 3:
             x = x.unsqueeze(0)
-            
-        # 각 개별 모델의 목표 해상도(224 또는 448)에 맞춰 유연하게 리사이즈
+
         if x.shape[-2:] != (self.input_size, self.input_size):
+            import torch.nn.functional as F
             x = F.interpolate(
-                x, size=(self.input_size, self.input_size),
-                mode="bilinear", align_corners=False
+                x,
+                size=(self.input_size, self.input_size),
+                mode="bilinear",
+                align_corners=False
             )
-            
-        # 정규화 연산 (디바이스 일치 보장)
-        normalized = (x - self._mean) / self._std
-        return normalized
 
-    def logits(self, preprocessed: torch.Tensor) -> torch.Tensor:
-        # 전처리된 텐서 장치 상태 최종 확인 후 순방향 연산
-        if preprocessed.device != self._device:
-            preprocessed = preprocessed.to(self._device)
-        return self._model(pixel_values=preprocessed).logits
+        preprocessed = (x - self._mean) / self._std
+        
+        return preprocessed.to(self._device)
 
-    def to(self, device: torch.device) -> "HFClassifierWrapper":
-        """장치 변경 명령이 내려올 때 가중치와 하이퍼파라미터를 동시 이동"""
-        self._device = device
-        self._model.to(device)
-        self._mean = nn.Parameter(self._mean.to(device), requires_grad=False)
-        self._std = nn.Parameter(self._std.to(device), requires_grad=False)
-        return self
+    def logits(self, preprocessed_x: torch.Tensor) -> torch.Tensor:
+        if preprocessed_x.dim() == 3:
+            preprocessed_x = preprocessed_x.unsqueeze(0)
+    
+        current_device = next(self._model.parameters()).device
+        preprocessed_x = preprocessed_x.to(current_device)
+
+        outputs = self._model(pixel_values=preprocessed_x)
+        res = outputs.logits  # 원본 그대로 유지
+
+        if res.dim() == 1:
+            res = res.unsqueeze(0)
+        elif res.dim() > 2:
+            res = res.view(1, -1)
+
+        if res.size(0) != 1:
+            res = res[:1]
+
+        if res.numel() == 0:
+            print(f"\n[WARNING] Unexpected logits shape — model: {getattr(self._model.config, '_name_or_path', 'Unknown')}")
+            print(f"Raw outputs.logits shape: {outputs.logits.shape}, after reshape: {res.shape}")
+            res = torch.zeros(1, 5, device=current_device)
+
+        return res  # 항상 [1, C]
+
+
 
 
 # ── Back-end 2: VLM zero-shot (CLIP / SigLIP / SigLIP2) ──────────────────────
@@ -591,22 +614,30 @@ def _parse_extended_spec(spec: str) -> tuple[str, str, str, list[str]]:
 
 def parse_spec(spec_str: str) -> dict:
     """
-    Parses a spec string like 'Falconsai/nsfw_image_detection:nsfw' or 
-    'backend@model_id:target_cls:activation' into a standardized spec dict.
+    '-S' 옵션 인자를 안전하게 분해하여 딕셔너리로 반환합니다.
     """
-    # 기본값 설정
     backend = "hf"
-    activation = ActivationFn.SOFTMAX  # 혹은 정의된 Enum 기본값
     
-    # 래퍼 규격 파싱 로직 구현부
-    if "@" in spec_str:
-        backend, spec_str = spec_str.split("@", 1)
-        
-    target_cls = None
-    if ":" in spec_str:
-        model_id, target_cls = spec_str.split(":", 1)
+    # 1. 백엔드 접두사 검사 (hf:, vlm:, timm:)
+    for prefix in ["hf:", "vlm:", "timm:"]:
+        if spec_str.startswith(prefix):
+            backend = prefix[:-1]  # 오타 수정 완료
+            spec_str = spec_str[len(prefix):]
+            break
+            
+    # 2. 역방향 탐색으로 타겟 클래스 분리
+    colon_idx = spec_str.rfind(":")
+    if colon_idx != -1:
+        model_id = spec_str[:colon_idx]
+        target_cls = spec_str[colon_idx + 1:]
     else:
         model_id = spec_str
+        target_cls = None
+
+    if "siglip" in model_id.lower():
+        activation = ActivationFn.SIGMOID
+    else:
+        activation = ActivationFn.SOFTMAX
         
     return {
         "backend": backend,
@@ -637,19 +668,15 @@ def build_wrapper(spec_str: str, accelerator=None) -> VisionClassifierWrapper:
             if processor is None:
                 raise ValueError("Processor returned None")
         except Exception:
-            # Freepik 모델처럼 preprocessor_config.json이 유실된 경우의 핵심 오버라이드
-            logging.warning(f"[{model_id}] preprocessor_config.json 누락으로 표준 프로세서 구성을 재 매핑합니다.")
+            logging.warning(f"[{model_id}] preprocessor_config.json not found — falling back to default processor config.")
             processor = AutoImageProcessor.from_pretrained("google/vit-base-patch16-224")
-            
-            # 모델 명세(EVA-ViT 448) 정보를 프로세서 크기에 강제 동기화
             if hasattr(model.config, "image_size"):
                 target_sz = model.config.image_size
                 if isinstance(target_sz, int):
                     processor.size = {"height": target_sz, "width": target_sz}
 
         target_idx = _resolve_target_idx_from_model(model, target_cls)
-        
-        # 래퍼 인스턴스화
+
         wrapper = HFClassifierWrapper(
             model_id=model_id,
             processor=processor,
@@ -657,8 +684,7 @@ def build_wrapper(spec_str: str, accelerator=None) -> VisionClassifierWrapper:
             target_idx=target_idx,
             activation=activation
         )
-        
-        # 생성된 래퍼 내부 파라미터(mean, std 등)들을 가속기 디바이스와 완벽 동기화
+
         wrapper.to(device)
 
         logging.info(
@@ -667,6 +693,8 @@ def build_wrapper(spec_str: str, accelerator=None) -> VisionClassifierWrapper:
             f"all_labels={wrapper.id2label}"
         )
         return wrapper
+    else:
+        raise NotImplementedError(f"Backend '{backend}' is not yet implemented.")
 
 def _resolve_target_idx_from_model(model, target: str | int | None) -> int:
     """

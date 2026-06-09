@@ -224,7 +224,7 @@ def apply_geometric_transform(
         translate=translate,
         scale=scale,
         shear=0,
-        resample=Image.LANCZOS,
+        interpolation=transforms.InterpolationMode.LANCOZS,
     )
 
 
@@ -381,24 +381,19 @@ def pgd_attack(
 
         adv_native = orig + delta
 
-        # ── 래퍼(Wrapper) 기반 전처리 및 손실 계산 ──
         target_probs: list[torch.Tensor] = []
         loss_cls = torch.tensor(0.0, device=device)
         loss_kl  = torch.tensor(0.0, device=device)
 
         for w in wrappers:
-            x_in      = w.preprocess(adv_native)          # 리사이즈 + 정규화 (미분 가능)
-            logits    = w.logits(x_in)                    # 로짓 수집
-            
-            # 로그 출력을 위한 개별 타겟 클래스 확률 수집
-            prob      = w.probs(x_in)[w.target_idx]
+            x_in      = w.preprocess(adv_native)
+            logits = w.logits(x_in)
+            prob   = F.softmax(logits, dim=-1)[0, w.target_idx]
             target_probs.append(prob)
             
-            # 누적 손실 계산
             loss_cls += w.cls_loss(logits, label_smooth)
             loss_kl  += w.kl_loss(logits, orig, kl_temp)
 
-        # 앙상블 모델 수로 나눠 평균 손실로 변환
         loss_cls = loss_cls / len(wrappers)
         loss_kl  = loss_kl / len(wrappers)
         
@@ -622,9 +617,9 @@ def main() -> None:
 
     # ── Load ensemble ─────────────────────────────────────────────────────────
     wrappers: list[VisionClassifierWrapper] = [
-        build_wrapper(s, accelerator) for s in args.specs
+        build_wrapper(s, accelerator) for s in (args.specs or [m for m, _ in specs_parsed])
     ]
-# ── LPIPS network ─────────────────────────────────────────────────────────
+    # ── LPIPS network ─────────────────────────────────────────────────────────
     lpips_net = None
     if HAS_LPIPS and not args.no_lpips:
         log.info("loading LPIPS perceptual loss network (AlexNet backbone)")
@@ -662,14 +657,19 @@ def main() -> None:
         orig_tensor = tensor_from_pil(pil_img)
 
         # Original target-class score (ensemble average)
-        orig_score_avg = sum(w.score(orig_tensor) for w in wrappers) / len(wrappers)
+        orig_tensor = orig_tensor.to(accelerator.device)
+        orig_scores = []
+        for w in wrappers:
+            try:
+                score_val = w.score(orig_tensor)
+                orig_scores.append(score_val)
+            except Exception as e:
+                print(f"\nModel exception: {getattr(w, 'model_id', 'Unknown Model')}")
+                print(f"Error: {e}")
+                raise e
 
-        log.info(
-            f"[{img_path.name}] original target ({target_label_str}) avg: "
-            f"{orig_score_avg:.4f}"
-        )
+        orig_score_avg = sum(orig_scores) / len(wrappers)
 
-        # Run PGD attack (정리된 wrappers 구조만 인자로 전달)
         adv_tensor = pgd_attack(
             wrappers=wrappers,
             orig_tensor=orig_tensor,

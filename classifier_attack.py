@@ -39,12 +39,15 @@ Usage:
   python classifier_attack.py --model Falconsai/nsfw_image_detection
 """
 
+import ast
 import argparse
 import logging
 import sys
 import time
 from pathlib import Path
 
+import random
+from enum import Enum
 from accelerate import Accelerator
 import numpy as np
 import torch
@@ -85,6 +88,155 @@ if not HAS_SCIPY:
     log.warning("scipy not found — DCT high-frequency preservation disabled.")
     log.warning("  install with: uv pip install scipy")
 
+
+class Optimizer(str, Enum):
+    ADAM    = "adam"
+    SGD_NAG = "sgd-nesterov"
+    SIGN    = "sign"
+
+class Algo(str, Enum):
+    VANILLA  = "vanilla"
+    MIFGSM   = "mifgsm"
+    NIFGSM   = "nifgsm"
+    VMIFGSM  = "vmifgsm"
+
+class DeltaUpdater:
+    """
+    delta 업데이트 규칙.
+
+    --optimizer는 두 네임스페이스 중 하나로 지정한다.
+      torch.<OptimizerClassName>  : torch.optim에 있는 임의의 옵티마이저를 동적으로 resolve
+                                     (예: torch.Adam, torch.SGD, torch.RAdam, torch.NAdam ...)
+      vanilla.<name>              : 이 프로젝트가 직접 구현한 업데이트 규칙 ('sign', 'lion')
+
+    --algo가 vanilla가 아니면(mifgsm/nifgsm/vmifgsm/soft-mifgsm) --optimizer는 무시되고
+    내부적으로 vanilla.sign 기반의 모멘텀-부호 업데이트로 강제 동작한다.
+    """
+    MOMENTUM_ALGOS = {Algo.MIFGSM, Algo.NIFGSM, Algo.VMIFGSM, Algo.SOFT_MIFGSM}
+    VANILLA_NAMES  = {"sign", "lion"}
+    UNSUPPORTED_TORCH = {"LBFGS"}  # closure 기반이라 1-step 루프와 호환 불가
+
+    def __init__(
+        self,
+        optimizer: str,
+        algo: str,
+        delta: torch.Tensor,
+        lr: float,
+        mu: float = 1.0,
+        soft_temp: float = 0.5,
+        lion_beta1: float = 0.9,
+        lion_beta2: float = 0.99,
+        optimizer_kwargs: dict | None = None,
+    ):
+        self.algo = algo
+        self.delta = delta
+        self.lr = lr
+        self.mu = mu
+        self.soft_temp = soft_temp
+        self.lion_beta1 = lion_beta1
+        self.lion_beta2 = lion_beta2
+        self.momentum  = torch.zeros_like(delta)   # mifgsm 계열 공용 모멘텀
+        self.lion_slow = torch.zeros_like(delta)   # lion 전용 느린(2차) 모멘텀
+
+        # algo가 vanilla가 아니면 optimizer 선택 자체가 무의미하므로 강제 통일
+        resolved = optimizer if algo == Algo.VANILLA else "vanilla.sign"
+        self.namespace, self.opt_name = self._parse_namespace(resolved)
+
+        self.torch_opt = None
+        if self.namespace == "torch":
+            self.torch_opt = self._build_torch_optimizer(
+                self.opt_name, delta, lr, optimizer_kwargs or {}
+            )
+        elif self.opt_name not in self.VANILLA_NAMES:
+            raise ValueError(
+                f"Unknown vanilla optimizer 'vanilla.{self.opt_name}'. "
+                f"Available: {sorted(self.VANILLA_NAMES)}."
+            )
+
+    @staticmethod
+    def _parse_namespace(optimizer: str) -> tuple[str, str]:
+        if "." not in optimizer:
+            raise ValueError(
+                f"Invalid --optimizer value '{optimizer}'. "
+                f"Must be namespaced as 'torch.<OptimizerClassName>' (e.g. 'torch.Adam') "
+                f"or 'vanilla.<name>' (e.g. 'vanilla.sign', 'vanilla.lion')."
+            )
+        namespace, name = optimizer.split(".", 1)
+        if namespace not in ("torch", "vanilla"):
+            raise ValueError(
+                f"Invalid --optimizer namespace '{namespace}' in '{optimizer}'. Must be 'torch' or 'vanilla'."
+            )
+        return namespace, name
+
+    @classmethod
+    def _build_torch_optimizer(cls, cls_name: str, delta: torch.Tensor, lr: float, extra_kwargs: dict):
+        if cls_name in cls.UNSUPPORTED_TORCH:
+            raise ValueError(
+                f"'torch.{cls_name}' requires a closure-based step() call and is not supported "
+                f"by this single-step PGD loop. Choose a first-order optimizer (e.g. 'torch.Adam', 'torch.SGD')."
+            )
+        opt_cls = getattr(torch.optim, cls_name, None)
+        if opt_cls is None or not (isinstance(opt_cls, type) and issubclass(opt_cls, torch.optim.Optimizer)):
+            raise ValueError(
+                f"'torch.{cls_name}' is not a valid PyTorch optimizer — no class named '{cls_name}' "
+                f"found in torch.optim (installed PyTorch version: {torch.__version__}). "
+                f"Class names are case-sensitive, e.g. 'torch.Adam', not 'torch.adam'."
+            )
+        try:
+            return opt_cls([delta], lr=lr, **extra_kwargs)
+        except TypeError as e:
+            raise ValueError(
+                f"Failed to construct torch.optim.{cls_name}(lr={lr}, **{extra_kwargs}): {e}. "
+                f"This optimizer likely needs extra arguments — pass them via "
+                f"--optimizer-kwargs \"key=value,key2=value2\" (e.g. \"momentum=0.9,nesterov=True\")."
+            ) from e
+
+    def lookahead_offset(self) -> torch.Tensor:
+        if self.algo == Algo.NIFGSM:
+            return self.mu * self.lr * self.momentum
+        return torch.zeros_like(self.delta)
+
+    def step(self, grad: torch.Tensor) -> None:
+        if self.torch_opt is not None:
+            self.delta.grad = grad
+            self.torch_opt.step()
+            self.torch_opt.zero_grad()
+            return
+
+        with torch.no_grad():
+            if self.algo in self.MOMENTUM_ALGOS:
+                g = grad / (grad.abs().mean() + 1e-12)
+                self.momentum = self.mu * self.momentum + g
+                if self.algo == Algo.SOFT_MIFGSM:
+                    self.delta -= self.lr * torch.tanh(self.momentum / self.soft_temp)
+                else:
+                    self.delta -= self.lr * self.momentum.sign()
+
+            elif self.opt_name == "lion":
+                update = torch.sign(
+                    self.lion_beta1 * self.lion_slow + (1 - self.lion_beta1) * grad
+                )
+                self.delta -= self.lr * update
+                self.lion_slow = self.lion_beta2 * self.lion_slow + (1 - self.lion_beta2) * grad
+
+            else:  # vanilla.sign
+                self.delta -= self.lr * grad.sign()
+
+def parse_kv_string(s: str) -> dict:
+    """'key=value,key2=value2' 형태 문자열을 dict로 파싱. 값은 가능하면 Python 리터럴로 평가."""
+    if not s:
+        return {}
+    out: dict = {}
+    for pair in s.split(","):
+        if "=" not in pair:
+            raise ValueError(f"Invalid kwargs segment '{pair}' — expected key=value.")
+        k, v = pair.split("=", 1)
+        k, v = k.strip(), v.strip()
+        try:
+            out[k] = ast.literal_eval(v)
+        except (ValueError, SyntaxError):
+            out[k] = v  # 리터럴로 안 풀리면 문자열 그대로 사용
+    return out
 
 # ── Constants ──────────────────────────────────────────────────────────────────
 
@@ -214,8 +366,7 @@ def apply_geometric_transform(
     translate: tuple[float, float] = (0, 0),
 ) -> torch.Tensor:
     """
-    Apply an affine transformation (rotation, scaling, translation) using
-    Lanczos resampling.
+    Apply an affine transformation (rotation, scaling, translation).
     tensor: CHW [0, 1]
     """
     return transforms.functional.affine(
@@ -224,9 +375,106 @@ def apply_geometric_transform(
         translate=translate,
         scale=scale,
         shear=0,
-        interpolation=transforms.InterpolationMode.LANCOZS,
+        interpolation=transforms.InterpolationMode.BILINEAR,  # LANCZOS는 스텝마다 쓰기엔 비용이 큼
     )
 
+# ── EOT-style robustness sampling ──────────────────────────────────────────────
+
+def eot_view(
+    adv_native: torch.Tensor,
+    multi_scale: bool,
+    use_jpeg: bool,
+    use_transforms: bool,
+) -> torch.Tensor:
+    """매 스텝마다 무작위 견고성 변환 하나를 적용한 뷰를 반환한다."""
+    choices = ["identity"]
+    if multi_scale:    choices.append("scale")
+    if use_transforms: choices.append("affine")
+    if use_jpeg:       choices.append("jpeg")
+    choice = random.choice(choices)
+
+    if choice == "scale":
+        factor = random.choice([0.5, 0.75, 1.0])
+        h, w = adv_native.shape[-2:]
+        small = F.interpolate(
+            adv_native.unsqueeze(0), scale_factor=factor,
+            mode="bilinear", align_corners=False,
+        )
+        return F.interpolate(
+            small, size=(h, w), mode="bilinear", align_corners=False
+        ).squeeze(0)
+
+    if choice == "affine":
+        angle = random.uniform(-8, 8)
+        return apply_geometric_transform(adv_native, angle=angle)
+
+    if choice == "jpeg":
+        with torch.no_grad():
+            compressed = apply_jpeg_compression(adv_native, quality=random.choice([95, 85, 75]))
+        return adv_native + (compressed - adv_native).detach()  # straight-through
+
+    return adv_native
+
+
+# ── Translation-invariant gradient smoothing (TIM) ─────────────────────────────
+
+def ti_smooth(grad: torch.Tensor, kernel_size: int = 7, sigma: float = 3.0) -> torch.Tensor:
+    """평행이동 불변성을 흉내내기 위해 그래디언트를 가우시안 커널로 컨볼브."""
+    coords = torch.arange(kernel_size, dtype=torch.float32, device=grad.device) - kernel_size // 2
+    g = torch.exp(-(coords ** 2) / (2 * sigma ** 2))
+    k1d = g / g.sum()
+    kernel = (k1d[:, None] @ k1d[None, :]).expand(grad.shape[0], 1, kernel_size, kernel_size)
+    return F.conv2d(
+        grad.unsqueeze(0), kernel, padding=kernel_size // 2, groups=grad.shape[0]
+    ).squeeze(0)
+
+
+# ── 모델별 정규화 앙상블 그래디언트 ──────────────────────────────────────────────
+
+def ensemble_grad(
+    wrappers: list[VisionClassifierWrapper],
+    view: torch.Tensor,
+    orig: torch.Tensor,
+    delta: torch.Tensor,
+    label_smooth: float,
+    lambda_kl: float,
+    kl_temp: float,
+    converged_thresh: float = 0.01,
+) -> tuple[torch.Tensor, float, float, list[float]]:
+    """
+    모델별 그래디언트를 norm이 아니라 '얼마나 안 풀렸는지'로 가중해 합산한다.
+    이미 converged_thresh 아래로 떨어진 모델은 잡음 증폭을 막기 위해
+    그래디언트를 거의 무시(낮은 가중치)한다.
+    """
+    raw_grads, weights, target_probs = [], [], []
+    loss_cls_sum, loss_kl_sum = 0.0, 0.0
+
+    for w in wrappers:
+        delta.grad = None
+        x_in   = w.preprocess(view)
+        logits = w.logits(x_in)
+        p = F.softmax(logits, dim=-1)[0, w.target_idx].item()
+        target_probs.append(p)
+
+        l_cls = w.cls_loss(logits, label_smooth)
+        l_kl  = w.kl_loss(logits, orig, kl_temp)
+        (l_cls + lambda_kl * l_kl).backward(retain_graph=True)
+
+        raw_grads.append(delta.grad.clone())
+        # 이미 충분히 떨어진(converged) 모델은 가중치를 낮춰 잡음 증폭을 방지
+        weights.append(p if p > converged_thresh else converged_thresh * (p / converged_thresh))
+        loss_cls_sum += l_cls.item()
+        loss_kl_sum  += l_kl.item()
+
+    weights_t = torch.tensor(weights, device=delta.device)
+    weights_t = weights_t / (weights_t.sum() + 1e-8)
+
+    # 모델별로 unit-norm 방향만 취하고, 가중치로 크기를 결정
+    directions = [g / (g.norm() + 1e-8) for g in raw_grads]
+    grad = sum(w_i * d for w_i, d in zip(weights_t, directions))
+
+    n = len(wrappers)
+    return grad, loss_cls_sum / n, loss_kl_sum / n, target_probs
 
 # ── Spec parsing ───────────────────────────────────────────────────────────────
 
@@ -349,7 +597,16 @@ def pgd_attack(
     image_name: str,
     eps: float = 0.03,
     steps: int = 100,
+    optimizer: str = "torch.Adam",
+    algo: str = "vanilla",
     lr: float = 0.005,
+    momentum_mu: float = 1.0,
+    soft_temp: float = 0.5,
+    lion_beta1: float = 0.9,
+    lion_beta2: float = 0.99,
+    optimizer_kwargs: dict | None = None,
+    vmi_n: int = 3,
+    vmi_beta: float = 1.5,
     lambda_lpips: float = 2.0,
     mu_l2: float = 0.5,
     lpips_net=None,
@@ -357,74 +614,88 @@ def pgd_attack(
     label_smooth: float = 0.1,
     lambda_kl: float = 0.3,
     kl_temp: float = 2.0,
+    multi_scale: bool = False,
+    use_jpeg: bool = False,
+    use_transforms: bool = False,
+    reg_weight: float = 0.25,
 ) -> torch.Tensor:
     """
-    PGD attack maximising the target class probability for each model in the
-    ensemble while minimising perceptual distortion.
-
-    Loss:
-      L = L_cls(soft-label KL) + lambda_kl * L_KL(orig||adv)
-          + lambda_lpips * L_LPIPS + mu_l2 * L_L2
+    PGD 계열 공격. 모델별 정규화 그래디언트 합산 + EOT 견고성 샘플링 +
+    TIM 그래디언트 스무딩 + 선택 가능한 옵티마이저/알고리즘(adam, sgd-nesterov,
+    sign-pgd, mifgsm, nifgsm, vmifgsm)을 지원한다.
     """
     orig = orig_tensor.to(device)
-    delta = torch.zeros_like(orig, requires_grad=True, device=device)
+    delta = ((torch.rand_like(orig) * 2 - 1) * eps).clamp(-eps, eps).to(device).requires_grad_(True)
+    updater = DeltaUpdater(
+        optimizer=optimizer, algo=algo, delta=delta, lr=lr, mu=momentum_mu,
+        soft_temp=soft_temp, lion_beta1=lion_beta1, lion_beta2=lion_beta2,
+        optimizer_kwargs=optimizer_kwargs,
+    )
 
-    optimizer = torch.optim.Adam([delta], lr=lr)
     step_w = len(str(steps))
-
     log_fn = accelerator.print if accelerator else log.info
-    log_fn(f"[{image_name}] starting PGD  steps={steps}  eps={eps}  lr={lr}")
+    log_fn(
+        f"[{image_name}] starting PGD  steps={steps}  eps={eps}  "
+        f"optimizer={optimizer}  algo={algo}  lr={lr}"
+    )
 
     t0 = time.time()
     for step in range(1, steps + 1):
-        optimizer.zero_grad()
+        delta.grad = None
 
-        adv_native = orig + delta
+        lookahead   = updater.lookahead_offset()
+        adv_native  = orig + delta + lookahead
+        adv_view    = eot_view(adv_native, multi_scale, use_jpeg, use_transforms)
 
-        target_probs: list[torch.Tensor] = []
-        loss_cls = torch.tensor(0.0, device=device)
-        loss_kl  = torch.tensor(0.0, device=device)
+        grad_cls, loss_cls_avg, loss_kl_avg, target_probs = ensemble_grad(
+            wrappers, adv_view, orig, delta, label_smooth, lambda_kl, kl_temp
+        )
 
-        for w in wrappers:
-            x_in      = w.preprocess(adv_native)
-            logits = w.logits(x_in)
-            prob   = F.softmax(logits, dim=-1)[0, w.target_idx]
-            target_probs.append(prob)
-            
-            loss_cls += w.cls_loss(logits, label_smooth)
-            loss_kl  += w.kl_loss(logits, orig, kl_temp)
+        # VMI-FGSM: 주변 점들의 그래디언트 평균 - 현재 그래디언트 = 분산 보정항
+        # (vmi_n번의 추가 앙상블 forward/backward가 필요해 비용이 큽니다)
+        if algo == Algo.VMIFGSM and vmi_n > 0:
+            neighbor_grads = []
+            for _ in range(vmi_n):
+                r = (torch.rand_like(delta) * 2 - 1) * (vmi_beta * eps)
+                neighbor_view = eot_view(orig + delta + lookahead + r, multi_scale, use_jpeg, use_transforms)
+                g_n, _, _, _ = ensemble_grad(
+                    wrappers, neighbor_view, orig, delta, label_smooth, lambda_kl, kl_temp
+                )
+                neighbor_grads.append(g_n)
+            variance_term = torch.stack(neighbor_grads).mean(0) - grad_cls
+            grad_cls = grad_cls + variance_term
 
-        loss_cls = loss_cls / len(wrappers)
-        loss_kl  = loss_kl / len(wrappers)
-        
-        loss_l2  = (delta ** 2).mean()
+        grad_cls = ti_smooth(grad_cls)
 
-        # ── Perceptual regularisation (LPIPS) ────────────────────────────────
+        # 지각/L2 정규화 손실 — 변환 뷰가 아닌 실제 저장될 이미지(adv_native) 기준
+        delta.grad = None
+        loss_l2 = (delta ** 2).mean()
         if lpips_net is not None:
             loss_lpips = lpips_net(orig.unsqueeze(0), adv_native.unsqueeze(0)).mean()
-            loss = (
-                loss_cls
-                + lambda_kl   * loss_kl
-                + lambda_lpips * loss_lpips
-                + mu_l2       * loss_l2
-            )
+            reg_loss = lambda_lpips * loss_lpips + mu_l2 * loss_l2
         else:
             loss_lpips = torch.tensor(0.0)
-            loss = loss_cls + lambda_kl * loss_kl + mu_l2 * loss_l2
+            reg_loss = mu_l2 * loss_l2
+        reg_loss.backward()
+        grad_reg = delta.grad.clone() if delta.grad is not None else torch.zeros_like(delta)
 
-        loss.backward()
-        optimizer.step()
+        # grad_cls와 매 스텝 부호 다툼을 벌이지 않도록, reg_weight 비율로 상한만 둔다.
+        # raw grad_reg가 자연히 작으면(이미 충분히 만족됐으면) 그대로 작게 둔다.
+        cls_norm = grad_cls.norm() + 1e-8
+        reg_norm = grad_reg.norm() + 1e-8
+        scale = torch.clamp(reg_weight * cls_norm / reg_norm, max=1.0)
+        grad_reg = grad_reg * scale
 
-        # Project delta back onto the Linf ball
+        updater.step(grad_cls + grad_reg)
+
         with torch.no_grad():
             delta.clamp_(-eps, eps)
 
-        target_scores_str = "  ".join(f"{p.item():.4f}" for p in target_probs)
+        target_scores_str = "  ".join(f"{p:.4f}" for p in target_probs)
         log_fn(
             f"[{image_name}] step [{step:0{step_w}d}/{steps}]  "
-            f"loss={loss.item():.6f}  "
-            f"loss_cls={loss_cls.item():.6f}  "
-            f"loss_kl={loss_kl.item():.6f}  "
+            f"loss_cls={loss_cls_avg:.6f}  "
+            f"loss_kl={loss_kl_avg:.6f}  "
             f"loss_lpips={loss_lpips.item():.6f}  "
             f"loss_l2={loss_l2.item():.6f}  |  "
             f"target: {target_scores_str}"
@@ -496,7 +767,7 @@ def main() -> None:
         help="Number of PGD optimisation steps (default 100)",
     )
     parser.add_argument(
-        "--lr", type=float, default=0.005,
+        "--lr", type=float, default=None,
         help="Adam learning rate (default 0.005)",
     )
     parser.add_argument(
@@ -567,6 +838,53 @@ def main() -> None:
         action="store_true",
         help="Enable all robustness features (equivalent to --multi-scale --use-jpeg --use-transforms --preserve-hf)",
     )
+    parser.add_argument(
+        "-A", "--algo",
+        choices=[a.value for a in Algo],
+        default="vanilla",
+        help="delta 업데이트 알고리즘. vanilla가 아니면 --optimizer는 무시됩니다 (default: vanilla)",
+    )
+    parser.add_argument(
+        "--optimizer",
+        type=str,
+        default=None,
+        help=(
+            "Optimizer for --algo vanilla. Namespaced as 'torch.<OptimizerClassName>' "
+            "(any class in torch.optim, e.g. 'torch.Adam', 'torch.RAdam', 'torch.SGD') "
+            "or 'vanilla.<name>' (hand-rolled: 'vanilla.sign', 'vanilla.lion'). Default: torch.Adam."
+        ),
+    )
+    parser.add_argument(
+        "--optimizer-kwargs",
+        ype=str,
+        default="",
+        help='Extra kwargs for a torch.<...> optimizer as "key=value,key2=value2" '
+            '(e.g. "momentum=0.9,nesterov=True"). Ignored for vanilla.* optimizers.',
+    )
+    parser.add_argument(
+        "--lion-beta1", type=float, default=0.9,
+        help="vanilla.lion fast (update) momentum coefficient (default: 0.9)",
+    )
+    parser.add_argument(
+        "--lion-beta2", type=float, default=0.99,
+        help="vanilla.lion slow (accumulation) momentum coefficient (default: 0.99)",
+    )
+    parser.add_argument(
+        "--momentum-mu", type=float, default=1.0,
+        help="mifgsm/nifgsm/vmifgsm 모멘텀 계수 (default: 1.0)",
+    )
+    parser.add_argument(
+        "--vmi-n", type=int, default=3,
+        help="vmifgsm 주변 샘플링 개수 — 클수록 정확하지만 스텝당 비용이 커집니다 (default: 3)",
+    )
+    parser.add_argument(
+        "--vmi-beta", type=float, default=1.5,
+        help="vmifgsm 주변 샘플링 반경 = vmi_beta * eps (default: 1.5)",
+    )
+    parser.add_argument(
+        "--reg-weight", type=float, default=0.25,
+        help="공격 신호 대비 lpips/l2 정규화 그래디언트의 최대 비중 상한 (default: 0.25)",
+    )
 
     args = parser.parse_args()
 
@@ -589,6 +907,28 @@ def main() -> None:
         gradient_accumulation_steps=1,
         cpu=False,
     )
+
+    # ── optimizer / algo / lr 확정 ─────────────────────────────────────────
+    args.optimizer_kwargs = parse_kv_string(args.optimizer_kwargs)
+
+    if args.algo == "vanilla":
+        if args.optimizer is None:
+            args.optimizer = "torch.Adam"
+    else:
+        if args.optimizer is not None:
+            log.warning(
+                f"-A {args.algo} 지정 시 --optimizer 값({args.optimizer})은 무시되고 "
+                f"vanilla.sign 기반 모멘텀-부호 업데이트가 사용됩니다."
+            )
+        args.optimizer = "vanilla.sign"
+
+    if args.lr is None:
+        namespace = args.optimizer.split(".", 1)[0]
+        if args.algo != "vanilla" or namespace == "vanilla":
+            args.lr = args.eps / args.steps
+        else:
+            args.lr = 0.005
+        log.info(f"--lr 미지정 → optimizer={args.optimizer} algo={args.algo} 기준 자동 설정: {args.lr:.6f}")
 
     # ── Expand --robust shorthand ─────────────────────────────────────────────
     if args.robust:
@@ -670,14 +1010,23 @@ def main() -> None:
 
         orig_score_avg = sum(orig_scores) / len(wrappers)
 
-        adv_tensor = pgd_attack(
+        adv_tensor = adv_tensor = pgd_attack(
             wrappers=wrappers,
             orig_tensor=orig_tensor,
             device=device,
             image_name=img_path.name,
             eps=args.eps,
             steps=args.steps,
+            optimizer=args.optimizer,
+            algo=args.algo,
             lr=args.lr,
+            momentum_mu=args.momentum_mu,
+            soft_temp=args.soft_temp,
+            lion_beta1=args.lion_beta1,
+            lion_beta2=args.lion_beta2,
+            optimizer_kwargs=args.optimizer_kwargs,
+            vmi_n=args.vmi_n,
+            vmi_beta=args.vmi_beta,
             lambda_lpips=args.lambda_lpips,
             mu_l2=args.mu_l2,
             lpips_net=lpips_net,
@@ -685,7 +1034,17 @@ def main() -> None:
             label_smooth=args.label_smooth,
             lambda_kl=args.lambda_kl,
             kl_temp=args.kl_temp,
+            multi_scale=args.multi_scale,
+            use_jpeg=args.use_jpeg,
+            use_transforms=args.use_transforms,
+            reg_weight=args.reg_weight,
         )
+
+        if args.preserve_hf:
+            with torch.no_grad():
+                delta_final = (adv_tensor - orig_tensor.cpu()).clamp(-args.eps, args.eps)
+                delta_final = preserve_high_frequency_dct(delta_final, alpha=0.5)
+                adv_tensor = (orig_tensor.cpu() + delta_final).clamp(0, 1)
 
         adv_score_avg  = sum(w.score(adv_tensor)  for w in wrappers) / len(wrappers)
 

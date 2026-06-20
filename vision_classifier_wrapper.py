@@ -659,7 +659,6 @@ def build_wrapper(spec_str: str, accelerator=None) -> VisionClassifierWrapper:
     device = accelerator.device if accelerator is not None else torch.device("cpu")
 
     if backend == "hf":
-        # 모델을 먼저 로드합니다.
         model = AutoModelForImageClassification.from_pretrained(model_id).to(device)
         model.eval()
 
@@ -684,7 +683,6 @@ def build_wrapper(spec_str: str, accelerator=None) -> VisionClassifierWrapper:
             target_idx=target_idx,
             activation=activation
         )
-
         wrapper.to(device)
 
         logging.info(
@@ -693,6 +691,37 @@ def build_wrapper(spec_str: str, accelerator=None) -> VisionClassifierWrapper:
             f"all_labels={wrapper.id2label}"
         )
         return wrapper
+
+    elif backend == "vlm":
+        from transformers import AutoModel, AutoProcessor
+
+        model = AutoModel.from_pretrained(model_id).to(device)
+        model.eval()
+        processor = AutoProcessor.from_pretrained(model_id)
+
+        candidate_labels = [
+            lbl.strip() for lbl in (target_cls or "nsfw,safe").split(",") if lbl.strip()
+        ]
+        if len(candidate_labels) < 2:
+            candidate_labels.append("safe" if candidate_labels[0].lower() != "safe" else "nsfw")
+        target_label = candidate_labels[0]
+
+        wrapper = VLMZeroShotWrapper(
+            model_id=model_id,
+            model=model,
+            processor=processor,
+            candidate_labels=candidate_labels,
+            target_label=target_label,
+            device=device,
+        )
+
+        logging.info(
+            f"  loaded (vlm): {model_id}  candidate_labels={candidate_labels}  "
+            f"target_idx={wrapper.target_idx}  "
+            f"target_label='{candidate_labels[wrapper.target_idx]}'"
+        )
+        return wrapper
+
     else:
         raise NotImplementedError(f"Backend '{backend}' is not yet implemented.")
 

@@ -1,14 +1,14 @@
 [project]
-name = "classifier-attack"
+name = "HenryHazarder"
 version = "0.2.0"  # ✓ 업데이트
 description = "Generic adversarial attack against image classifiers using transformers and accelerate"
-readme = "readme.md"  # ✓ 추가
+readme = "readme.md"
 requires-python = ">=3.12"
 authors = [
-    {name = "HenryHazarder", email = "your-email@example.com"}  # ✓ 추가
+    {name = "HenryHazarder", email = "henryexplorer_social@aol.com" }
 ]
-license = {text = "MIT"}  # ✓ 추가
-keywords = ["nsfw", "adversarial", "attack", "transformers"]  # ✓ 추가
+license = {text = "MIT"}
+keywords = ["classifier", "adversarial", "attack", "transformers"]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Science/Research",
@@ -30,17 +30,43 @@ dependencies = [
     "scipy>=1.10.0",       # ← --preserve-hf 옵션(DCT 고주파)을 위해 추가
 ]
 
-[project.optional-dependencies]
+[dependency-groups]
 dev = [
     "ruff>=0.4",
     "pyright>=1.1",
-    "pytest>=7.4",  # ✓ 테스트용
+    "pytest>=7.4",
 ]
-cuda = [
-    "torch[cuda-12]>=2.0.0",  # ✓ CUDA 12 지원
+
+[project.optional-dependencies]
+cpu = ["torch>=2.0.0"]
+cu124 = ["torch>=2.0.0"]
+rocm6 = ["torch>=2.0.0"]
+
+[tool.uv.sources]
+torch = [
+  { index = "pytorch-cpu", extra = "cpu" },
+  { index = "pytorch-cu124", extra = "cu124" },
+  { index = "pytorch-rocm6", extra = "rocm6" },
 ]
-rocm = [
-    "torch[rocm-6.0]>=2.0.0",  # ✓ ROCm 지원
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-cu124"
+url = "https://download.pytorch.org/whl/cu124"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-rocm6"
+url = "https://download.pytorch.org/whl/rocm6.0"
+explicit = true
+
+[tool.uv.conflicts]
+extra = [
+  [{ extra = "cpu" }, { extra = "cu124" }, { extra = "rocm6" }]
 ]
 
 [project.urls]

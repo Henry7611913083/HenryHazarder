@@ -2,8 +2,6 @@
 
 input 폴더의 이미지를 Transformers 기반 여러 로컬 검열 모델로 앙상블 최적화하는 연구용 프로젝트입니다
 
-많은 분들도 저도 했다가 말았던 착각이 있는데 nsfw 손실은 소프트 라벨 때문에 0.9999 또는 1.000까지 안 올라가요
-
 ## 만든 동기
 
 ![Claude Sonnet 4.5](https://img.shields.io/badge/Claude_Sonnet_4.5-D97757?logo=anthropic&logoColor=white)
@@ -15,7 +13,8 @@ input 폴더의 이미지를 Transformers 기반 여러 로컬 검열 모델로 
 
 네, 추론 단계에선 **정상적으로 인식해서** 문제입니다,  하지만 우리 인간들이 기대한 건 **LLM도 못 알아볼 만큼 왜곡하는 것이였습니다**.
 
-제가 거기서 더 효과적이고 빠른 방법을 생각해봤는데 **일부러 검열 모델이 검열해야 할 흉물로 인식시켜서** 학습 데이터에 못 들어가게 하는 방법입니다. 
+제가 거기서 더 효과적이고 빠른 방법을 생각해봤는데 **일부러 검열 모델이 검열해야 할 흉물로 인식시켜서** 학습 데이터에 못 들어가게 하는 방법입니다.
+만약 수집되었다라도 노이즈가 학습 중 교란을 
 
 > 그래서 더 강화시킬 수 있는 방법을 제미나이에게 여러 번 물어보며 몇 개를 뽑고 그 다음 제가 떠올린 방법을 초기 코드를 Claude Sonnet 4.5가 짜고 세션 한도 때문에 깃허브 코파일럿으로 갔는데 클로드 하이쿠 3.5가 기본값이라 그대로 썼는데 생각보다 성능이 좋더라고요. (그 후엔 소넷 4.6, 하이쿠 4.6 번갈아썼지만)
 
@@ -45,14 +44,17 @@ uv sync
 ### GPU 지원 (선택사항)
 
 ```bash
-# NVIDIA CUDA 12.x
-uv pip install torch torchvision --index-url https://download.pytorch.org/whl/cu126
+# CPU 전용
+uv sync --extra cpu
+
+# NVIDIA CUDA 12.4
+uv sync --extra cu124
 
 # AMD ROCm 6.0+
-uv pip install torch torchvision --index-url https://download.pytorch.org/whl/rocm6.0
+uv sync --extra rocm6
 
 # Apple Silicon (MPS)
-# 기본 torch에서 자동 지원됨
+# 기본 torch에서 자동 지원되므로 --extra 불필요, 그냥 uv sync
 ```
 
 ## 셋팅과 실행
@@ -262,7 +264,7 @@ uv run pyright
 uv run pytest
 
 # 커버리지 포함
-uv run pytest --cov=nsfw_attack
+uv run pytest --cov=classifier_attack
 ```
 
 ## 라이선스

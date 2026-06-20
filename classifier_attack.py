@@ -1,5 +1,5 @@
 """
-nsfw_attack.py
+classifier_attack.py
 --------------
 Gradient-based adversarial perturbation that maximizes a user-specified target
 class score of any HuggingFace image classification model, while minimizing
@@ -54,7 +54,6 @@ import torch
 import torch.nn.functional as F
 from PIL import Image
 from torchvision import transforms
-from transformers import AutoImageProcessor, AutoModelForImageClassification
 from vision_classifier_wrapper import VisionClassifierWrapper, build_wrapper
 
 # ── Optional dependencies ──────────────────────────────────────────────────────
@@ -78,7 +77,7 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)-8s | %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
 )
-log = logging.getLogger("nsfw_attack")
+log = logging.getLogger("classifier_attack")
 
 if not HAS_LPIPS:
     log.warning("lpips not found — falling back to L2 regularization only.")
@@ -95,10 +94,11 @@ class Optimizer(str, Enum):
     SIGN    = "sign"
 
 class Algo(str, Enum):
-    VANILLA  = "vanilla"
-    MIFGSM   = "mifgsm"
-    NIFGSM   = "nifgsm"
-    VMIFGSM  = "vmifgsm"
+    VANILLA      = "vanilla"
+    MIFGSM       = "mifgsm"
+    NIFGSM       = "nifgsm"
+    VMIFGSM      = "vmifgsm"
+    SOFT_MIFGSM  = "soft-mifgsm"
 
 class DeltaUpdater:
     """
@@ -462,7 +462,8 @@ def ensemble_grad(
 
         raw_grads.append(delta.grad.clone())
         # 이미 충분히 떨어진(converged) 모델은 가중치를 낮춰 잡음 증폭을 방지
-        weights.append(p if p > converged_thresh else converged_thresh * (p / converged_thresh))
+        remaining = 1.0 - p
+        weights.append(remaining if remaining > converged_thresh else converged_thresh)
         loss_cls_sum += l_cls.item()
         loss_kl_sum  += l_kl.item()
 
@@ -856,7 +857,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--optimizer-kwargs",
-        ype=str,
+        type=str,
         default="",
         help='Extra kwargs for a torch.<...> optimizer as "key=value,key2=value2" '
             '(e.g. "momentum=0.9,nesterov=True"). Ignored for vanilla.* optimizers.',
@@ -884,6 +885,10 @@ def main() -> None:
     parser.add_argument(
         "--reg-weight", type=float, default=0.25,
         help="공격 신호 대비 lpips/l2 정규화 그래디언트의 최대 비중 상한 (default: 0.25)",
+    )
+    parser.add_argument(
+        "--soft-temp", type=float, default=0.5,
+        help="soft-mifgsm의 tanh temperature. 작을수록 부드럽고 잡음에 둔감, 클수록 sign에 가까움 (default: 0.5)",
     )
 
     args = parser.parse_args()
